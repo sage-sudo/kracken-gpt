@@ -1,16 +1,24 @@
-# -------------------- kraken_client.py --------------------
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
+
+# --- kraken_client.py ---
 import asyncio
 import websockets
-import threading
 import json
+import threading
 import time
-import requests
 from collections import OrderedDict
+from client_shared import shared_state, state_lock
+
 import ssl
 import certifi
 
+# For dev/debug — disables SSL verification. DO NOT use in prod.
 ssl_context = ssl._create_unverified_context()
+# Use this for proper SSL:
+# ssl_context = ssl.create_default_context(cafile=certifi.where())
 
 class LocalOrderBook:
     def __init__(self):
@@ -26,148 +34,66 @@ class LocalOrderBook:
             else:
                 book[price] = volume
 
+        sorted_items = sorted(book.items(), reverse=(side == "b"))
         if side == "b":
-            self.bids = OrderedDict(sorted(book.items(), reverse=True))
+            self.bids = OrderedDict(sorted_items)
         else:
-            self.asks = OrderedDict(sorted(book.items()))
+            self.asks = OrderedDict(sorted_items)
 
-    def patch_from_snapshot(self, snapshot_bids, snapshot_asks):
-        self._patch_side(snapshot_bids, self.bids, side="b")
-        self._patch_side(snapshot_asks, self.asks, side="a")
+    def top(self):
+        bid = next(iter(self.bids.items()), (None, None))
+        ask = next(iter(self.asks.items()), (None, None))
+        return bid, ask
 
-    def _patch_side(self, snapshot, book, side):
-        if len(book) >= 100:
-            return
+    def get_depth(self, depth=20):
+        bids = list(self.bids.items())[:depth]
+        asks = list(self.asks.items())[:depth]
+        return bids, asks
 
-        for update in snapshot:
-            price, volume = float(update[0]), float(update[1])
-            if price not in book and len(book) < 100:
-                book[price] = volume
-
-        if side == "b":
-            self.bids = OrderedDict(sorted(book.items(), reverse=True))
-        else:
-            self.asks = OrderedDict(sorted(book.items()))
-
-    def top_of_book(self):
-        best_bid = next(iter(self.bids.items()), (None, None))
-        best_ask = next(iter(self.asks.items()), (None, None))
-        return best_bid, best_ask
-
-    def spread(self):
-        bid, ask = self.top_of_book()
-        if bid[0] is not None and ask[0] is not None:
-            return round(ask[0] - bid[0], 2)
-        return None
-
-    def order_book_imbalance(self, depth=10):
-        top_bids = list(self.bids.items())[:depth]
-        top_asks = list(self.asks.items())[:depth]
-        bid_vol = sum(vol for _, vol in top_bids)
-        ask_vol = sum(vol for _, vol in top_asks)
-        if bid_vol + ask_vol == 0:
-            return None
-        return round((bid_vol - ask_vol) / (bid_vol + ask_vol), 4)
-
-    def needs_patch(self):
-        return len(self.bids) < 100 or len(self.asks) < 100
-
-class KrakenL2Client:
-    def __init__(self, shared_state, pairs=["XBT/USD"], depth=100):
+class KrakenClient:
+    def __init__(self, pairs=["XBT/USD"]):
         self.pairs = pairs
-        self.depth = depth
         self.uri = "wss://ws.kraken.com"
-        self.loop = None
-        self.thread = None
-        self.stop_event = threading.Event()
-        self.order_books = {pair: LocalOrderBook() for pair in self.pairs}
-        self.last_patch_time = time.time()
-        self.shared_state = shared_state
+        self.books = {pair: LocalOrderBook() for pair in self.pairs}
+        self.thread = threading.Thread(target=self.run)
+        self.thread.daemon = True
 
     async def connect(self):
-        async with websockets.connect(self.uri, ssl=ssl_context) as websocket:
-            await websocket.send(json.dumps({
+        async with websockets.connect(self.uri, ssl=ssl_context) as ws:
+            await ws.send(json.dumps({
                 "event": "subscribe",
                 "pair": self.pairs,
-                "subscription": {"name": "book", "depth": self.depth}
+                "subscription": {"name": "book"}
             }))
-            print(f"📡 Subscribed to: {', '.join(self.pairs)}")
+            while True:
+                message = await ws.recv()
+                self.handle(json.loads(message))
 
-            while not self.stop_event.is_set():
-                try:
-                    message = await websocket.recv()
-                    self.handle_message(json.loads(message))
-                    self.maybe_patch_books()
-                except Exception as e:
-                    print(f"⚠️ Error: {e}")
-                    break
+    def handle(self, msg):
+        if isinstance(msg, list) and len(msg) > 1:
+            data = msg[1]
+            pair = msg[-1]
+            book = self.books[pair]
 
-    def maybe_patch_books(self):
-        if time.time() - self.last_patch_time < 5:
-            return
-
-        for pair in self.pairs:
-            book = self.order_books[pair]
-            if book.needs_patch():
-                print(f"🔧 Patching {pair}...")
-                bids, asks = self.fetch_snapshot(pair)
-                if bids and asks:
-                    book.patch_from_snapshot(bids, asks)
-        self.last_patch_time = time.time()
-
-    def fetch_snapshot(self, pair):
-        symbol = pair.replace("/", "")
-        url = f"https://api.kraken.com/0/public/Depth?pair={symbol}&count=100"
-        try:
-            resp = requests.get(url, timeout=5)
-            data = resp.json()
-            key = list(data["result"].keys())[0]
-            return data["result"][key]["bids"], data["result"][key]["asks"]
-        except Exception as e:
-            print(f"❌ Snapshot error: {e}")
-            return None, None
-
-    def handle_message(self, message):
-        if isinstance(message, dict):
-            if message.get("event") in ["heartbeat", "systemStatus", "subscriptionStatus"]:
-                return
-
-        if isinstance(message, list) and len(message) > 1:
-            data = message[1]
-            pair = message[-1]
-            book = self.order_books.get(pair)
-            if not book:
-                return
-
-            if 'a' in data:
-                book.update(data['a'], 'a')
             if 'b' in data:
                 book.update(data['b'], 'b')
+            if 'a' in data:
+                book.update(data['a'], 'a')
 
-            bid, ask = book.top_of_book()
-            spread = book.spread()
-            imbalance = book.order_book_imbalance()
+            bid, ask = book.top()
+            bids, asks = book.get_depth()
 
-            self.shared_state[pair] = {
-                "bid": bid[0],
-                "ask": ask[0],
-                "spread": spread,
-                "imbalance": imbalance,
-                "timestamp": time.time(),
-            }
+            with state_lock:
+                shared_state[pair] = {
+                    "bid": bid[0],
+                    "ask": ask[0],
+                    "timestamp": time.time(),
+                    "bids": bids,
+                    "asks": asks
+                }
+
+    def run(self):
+        asyncio.run(self.connect())
 
     def start(self):
-        self.loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self.loop)
-        self.loop.run_until_complete(self.connect())
-
-    def run_in_thread(self):
-        self.thread = threading.Thread(target=self.start)
         self.thread.start()
-
-    def stop(self):
-        self.stop_event.set()
-        if self.loop:
-            self.loop.call_soon_threadsafe(self.loop.stop)
-        if self.thread:
-            self.thread.join()
