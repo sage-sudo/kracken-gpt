@@ -85,12 +85,15 @@ class KrakenClient:
 
             with state_lock:
                 shared_state[pair] = {
-                    "bid": bid[0],
-                    "ask": ask[0],
-                    "timestamp": time.time(),
-                    "bids": bids,
-                    "asks": asks
+                "bid_price": bid[0],
+                "bid_size": bid[1],
+                "ask_price": ask[0],
+                "ask_size": ask[1],
+                "timestamp": time.time(),
+                "bids": bids,
+                "asks": asks
                 }
+
 
     def run(self):
         asyncio.run(self.connect())
